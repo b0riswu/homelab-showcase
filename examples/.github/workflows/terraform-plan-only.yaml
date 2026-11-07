@@ -1,0 +1,124 @@
+# Plan-only Terraform CI.
+#
+# Upstream path: .github/workflows/cloudflare.yml (this copy lives under
+# examples/ so it does not run here). Sanitized: organisation name and token
+# names are placeholders.
+#
+# terraform/cloudflare: tofu plan on every PR that touches it, and on main after
+# the merge. Plan only, never apply: GitHub-hosted runners have no fixed address,
+# so a token here cannot be IP-filtered, and it therefore gets read permissions
+# only. Writes stay with the IP-filtered token, applied from the main checkout
+# after the merge.
+#
+# A plan does not write the state, so this needs no lock and a read-only B2 key.
+#
+# The repository allows only these two actions, at exactly these SHAs
+# (Settings -> Actions -> "Allow select actions"). Bumping a SHA below means
+# updating that allowlist first, or the run fails to start:
+#   gh api -X PUT repos/example-org/homelab/actions/permissions/selected-actions \
+#     -F github_owned_allowed=false -F verified_allowed=false \
+#     -f 'patterns_allowed[]=actions/checkout@<sha>' \
+#     -f 'patterns_allowed[]=opentofu/setup-opentofu@<sha>'
+#
+# Repository secrets:
+#   TFSTATE_B2_KEY_ID, TFSTATE_B2_APP_KEY  B2 key limited to listBuckets,
+#                                          listFiles, readFiles on the
+#                                          cloudflare/ prefix only
+#   TFSTATE_PASSPHRASE_CLOUDFLARE          state encryption passphrase (the plan
+#                                          has to decrypt the state)
+#   CLOUDFLARE_API_TOKEN                   Read-only counterpart of the
+#                                          write token used from the main checkout
+name: cloudflare
+
+on:
+  pull_request:
+    paths:
+      - terraform/cloudflare/**
+      - .github/workflows/cloudflare.yml
+  push:
+    branches: [main]
+    paths:
+      - terraform/cloudflare/**
+      - .github/workflows/cloudflare.yml
+
+concurrency:
+  group: tofu-cloudflare-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: tofu plan (cloudflare)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: terraform/cloudflare
+    # No secrets here: each is set only on the step that needs it, so checkout,
+    # setup-opentofu, fmt and validate never see them.
+    env:
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: 1.13.9
+          tofu_wrapper: false
+          # tofu_1.13.9_linux_amd64.zip, computed locally and matched against the
+          # release's SHA256SUMS. Pinned so a replaced release (zip and
+          # SHA256SUMS together) is rejected. Update with tofu_version.
+          checksums: |
+            bc44eb6b06446ba83bd4072114891987f590f66cca712737a7f1147c50c539ce
+
+      - name: fmt
+        run: tofu fmt -check -diff
+
+      # Reads the state from B2 to configure the backend: B2 key + passphrase.
+      - name: init
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.TFSTATE_B2_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TFSTATE_B2_APP_KEY }}
+          TF_VAR_state_passphrase: ${{ secrets.TFSTATE_PASSPHRASE_CLOUDFLARE }}
+        run: |
+          missing=""
+          [ -n "$AWS_ACCESS_KEY_ID" ] || missing="$missing TFSTATE_B2_KEY_ID"
+          [ -n "$AWS_SECRET_ACCESS_KEY" ] || missing="$missing TFSTATE_B2_APP_KEY"
+          [ -n "$TF_VAR_state_passphrase" ] || missing="$missing TFSTATE_PASSPHRASE_CLOUDFLARE"
+          if [ -n "$missing" ]; then echo "::error::repository secrets not set:$missing"; exit 1; fi
+          tofu init -lockfile=readonly -no-color
+
+      - name: validate
+        run: tofu validate -no-color
+
+      # -lock=false: the backend has no lock (B2), and a plan writes nothing.
+      # -detailed-exitcode: 0 = no changes, 2 = changes, anything else = error.
+      - name: plan
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.TFSTATE_B2_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TFSTATE_B2_APP_KEY }}
+          TF_VAR_state_passphrase: ${{ secrets.TFSTATE_PASSPHRASE_CLOUDFLARE }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then echo "::error::repository secret not set: CLOUDFLARE_API_TOKEN"; exit 1; fi
+          set +e
+          tofu plan -no-color -lock=false -detailed-exitcode > plan.txt 2>&1
+          status=$?
+          set -e
+          cat plan.txt
+          {
+            echo "### tofu plan ($EVENT_NAME, exit $status)"
+            if [ "$status" -eq 2 ]; then
+              echo "Changes pending: apply from the main checkout after the merge with \`terraform/tf cloudflare apply\`."
+            fi
+            echo '```'
+            head -c 60000 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$status" -eq 0 ] || [ "$status" -eq 2 ]

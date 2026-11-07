@@ -1,0 +1,127 @@
+#!/bin/bash
+# Ansible template: ansible/roles/backup_cron/templates/restic-backup.sh.j2
+# Rendered to /usr/local/bin/restic-backup.sh on the NAS and run daily at 03:00.
+#
+# Sanitized excerpt: every value that would be a secret or an identifier is a
+# Jinja variable sourced from Ansible Vault or group_vars, so no real value is
+# present here. Trimmed to the parts that encode the operating lessons:
+# failure alerting, interrupted-run handling, stale locks, the shrink guard and
+# the weekly data-verifying check.
+set -euo pipefail
+
+LOG_TAG="RESTIC-BACKUP"
+REPO="{{ restic_repo }}"
+HOST="$(hostname -s)"
+STATE_DIR="/var/lib/restic-backup"
+LAST_SIZE_FILE="${STATE_DIR}/last_size_bytes"
+
+set -a
+source /etc/restic/b2.env
+set +a
+
+log() { logger -t "$LOG_TAG" "$1"; }
+
+{% if backup_telegram_token and backup_telegram_chat_id %}
+notify() {
+  # A notification failure must never abort the backup, hence the `|| log`.
+  # --data-urlencode keeps the message body out of the URL.
+  curl -s -m 15 -o /dev/null \
+    --data-urlencode "chat_id={{ backup_telegram_chat_id }}" \
+    --data-urlencode "text=$1" \
+    "https://api.telegram.org/bot{{ backup_telegram_token }}/sendMessage" \
+    || log "WARNING: telegram notification failed"
+}
+{% else %}
+notify() { :; }   # no telegram credentials configured
+{% endif %}
+
+# The restic calls below pipe into logger, so plain `set -e` would not fire when
+# restic fails — logger's exit status would mask it. `set -o pipefail` above is
+# what propagates the failure; this trap turns it into an alert rather than a
+# silent non-zero exit that only cron would have seen.
+on_error() {
+  local line=$1
+  notify "Restic backup FAILED on ${HOST} (line ${line}). Check: journalctl -t ${LOG_TAG}"
+  log "FAILED at line ${line}"
+}
+trap 'on_error $LINENO' ERR
+
+# ERR does not fire on SIGTERM/SIGINT, so a run killed by a shutdown — the
+# NUT-triggered one during a power cut, most plausibly — would otherwise end
+# silently. Exit 128+signal per convention.
+on_signal() {
+  local sig=$1
+  notify "Restic backup on ${HOST} was interrupted (SIG${sig}). Repo is intact; the next run resumes from the chunks already uploaded."
+  log "interrupted by SIG${sig}"
+  exit $(( 128 + $2 ))
+}
+trap 'on_signal TERM 15' TERM
+trap 'on_signal INT 2' INT
+
+mkdir -p "$STATE_DIR"
+
+# A killed run leaves its lock behind and every later run then fails with
+# "repository is already locked" until someone intervenes. `unlock` only removes
+# stale locks (no heartbeat for ~30 min), so a genuinely concurrent run is left
+# alone. Failure here is not fatal: the backup below will report the lock.
+restic -r "$REPO" unlock 2>&1 | logger -t "$LOG_TAG" || true
+
+log "Starting restic backup"
+
+restic -r "$REPO" backup \
+{% for path in restic_backup_paths %}
+  {{ path }} \
+{% endfor %}
+  --exclude="*.tmp" \
+  --exclude=".Trash-*" \
+  --tag daily 2>&1 | logger -t "$LOG_TAG"
+
+log "Backup completed — starting prune"
+
+restic -r "$REPO" forget \
+  --keep-daily {{ restic_daily_keep }} \
+  --keep-monthly {{ restic_monthly_keep }} \
+  --prune 2>&1 | logger -t "$LOG_TAG"
+
+log "Prune completed"
+
+# --- Sanity check: did the repo shrink unexpectedly? -------------------------
+# restic faithfully backs up an empty source. If a dataset fails to mount, the
+# snapshot still succeeds and the real data then ages out of retention. A sharp
+# drop in repo size is the cheapest signal that this has happened.
+SIZE_BYTES="$(restic -r "$REPO" stats --mode raw-data --json 2>/dev/null \
+  | sed -n 's/.*"total_size":\([0-9]*\).*/\1/p' || echo 0)"
+
+if [[ "${SIZE_BYTES:-0}" -gt 0 ]]; then
+  if [[ -f "$LAST_SIZE_FILE" ]]; then
+    PREV="$(cat "$LAST_SIZE_FILE")"
+    if [[ "${PREV:-0}" -gt 0 ]]; then
+      PCT=$(( SIZE_BYTES * 100 / PREV ))
+      if [[ "$PCT" -lt {{ restic_shrink_alert_pct }} ]]; then
+        notify "Restic repo on ${HOST} shrank to ${PCT}% of its previous size ($(numfmt --to=iec "$PREV") -> $(numfmt --to=iec "$SIZE_BYTES")). A source may have been empty or unmounted."
+        log "WARNING: repo shrank to ${PCT}% of previous size"
+      fi
+    fi
+  fi
+  echo "$SIZE_BYTES" > "$LAST_SIZE_FILE"
+fi
+
+# --- Weekly integrity check + summary ---------------------------------------
+# `restic check` alone only validates repository structure. --read-data-subset
+# downloads and verifies a slice of the actual data, which is what catches bit
+# rot or truncated uploads on the B2 side. Weekly because it costs egress.
+#
+# The summary doubles as a liveness signal: with failure-only alerting, a cron
+# that never runs looks identical to a backup that always succeeds.
+if [[ "$(date +%u)" == "{{ restic_check_weekday }}" ]]; then
+  log "Running weekly integrity check"
+  restic -r "$REPO" check --read-data-subset={{ restic_check_subset }} 2>&1 | logger -t "$LOG_TAG"
+
+  SNAPS="$(restic -r "$REPO" snapshots --json 2>/dev/null | grep -o '"short_id"' | wc -l | tr -d ' ')"
+  notify "Weekly backup summary — ${HOST}
+Repo size: $(numfmt --to=iec "${SIZE_BYTES:-0}")
+Snapshots: ${SNAPS}
+Integrity check ({{ restic_check_subset }} of data): passed"
+  log "Weekly integrity check passed"
+  # A check failure trips the ERR trap above, so there is no else branch.
+fi

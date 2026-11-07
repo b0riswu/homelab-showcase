@@ -1,0 +1,34 @@
+# Upstream: kubernetes/infrastructure/argocd/root-app.yaml
+# App of apps: the Application that owns every Application in argocd-apps/.
+# Before 2026-10-31 those were applied with `kubectl apply -f argocd-apps/`, so a
+# changed path, include filter or targetRevision had no diff and no history in
+# ArgoCD — the one part of the deploy chain it could not account for.
+#
+# This file is applied by hand, once, at bootstrap, and is deliberately NOT inside
+# argocd-apps/: an Application that manages itself can sync away its own source.
+# It lives with the rest of ArgoCD's own install, which ArgoCD does not manage
+# either. Sanitized excerpt: repository URL is a placeholder.
+#
+# Same rules as every child: manual sync, no automated, no selfHeal, no prune.
+# Two more specific to this one:
+#   - No resources-finalizer. Deleting this Application must leave the child
+#     Applications (and therefore every workload) in place; with the finalizer,
+#     `kubectl delete application argocd-apps` would cascade.
+#   - prune would delete a child Application whose file is removed or renamed,
+#     and the children carry no finalizer either, so their workloads would stay —
+#     but they would silently drop out of ArgoCD. Retiring an Application stays a
+#     deliberate `kubectl delete`.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: argocd-apps
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:example-org/homelab.git
+    targetRevision: main
+    path: kubernetes/argocd-apps
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd

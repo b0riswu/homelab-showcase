@@ -1,0 +1,13 @@
+# Never commit state, plan files, variables with values, or cluster credentials.
+# This repository is excerpts only; these patterns are a second line of defence.
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+!*.tfvars.example
+.env
+.env.*
+kubeconfig
+talosconfig
+*secrets*.yaml
+sealed-secret*.yaml

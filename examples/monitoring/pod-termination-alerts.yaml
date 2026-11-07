@@ -1,0 +1,54 @@
+# Upstream: kubernetes/infrastructure/monitoring/pod-termination-alerts.yaml
+# Pod termination alerts.
+#
+# 2026-11-03: a stacked /var/lib/kubelet/pods bind mount on both workers made
+# kubelet's volume teardown fail with `unlinkat ...: device or resource busy`, so
+# every deleted pod stayed Terminating. StatefulSets wait for the old pod to go
+# away, so draining worker-1 took OpenBao, Alertmanager and the VictoriaMetrics /
+# VictoriaLogs singles down for ~9 minutes. Nothing alerted: the first teardown
+# failures were on 2026-10-31, and the stuck pods were found by hand while
+# verifying an unrelated rollout. Root cause and fix: PR #139 and
+# terraform/docs/troubleshooting.md ("Pods stuck Terminating"); post-mortem in
+# docs/postmortems/2026-11-03-pods-stuck-terminating.md.
+#
+# Backtested against the 7 days to 2026-11-03 (1-minute steps):
+# - PodStuckTerminating would have fired at 11:10 for the KSM and searxng pods
+#   deleted at 10:47/10:49 (and kept firing through the drain).
+# - KubeletVolumeTeardownFailing would have fired at ~10:08 (worker-1) and ~10:09
+#   (worker-2). Single bursts (node reboots before the CSI node plugin registers:
+#   `driver name ... not found`) keep the expression true for exactly the 10m
+#   window, so `for: 15m` never fires on them (3 such bursts in 7 days).
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMRule
+metadata:
+  name: pod-termination
+  namespace: monitoring
+spec:
+  groups:
+    - name: pod-termination
+      rules:
+        # 15 minutes after deletion, plus `for: 5m`. The longest
+        # terminationGracePeriodSeconds in the cluster is 300 s, so a pod still
+        # present 15 minutes after its deletionTimestamp is not shutting down
+        # slowly; kubelet cannot finish it. A StatefulSet pod in that state also
+        # blocks its replacement.
+        - alert: PodStuckTerminating
+          expr: (time() - kube_pod_deletion_timestamp) > 900
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} has been Terminating for over 15 minutes"
+            description: "kubelet cannot finish the pod; a StatefulSet will not create its replacement until it is gone. Check the node's kubelet log for `UnmountVolume.TearDown failed` and the stack count: `talosctl -n <node> read /proc/self/mountinfo | awk '$5==\"/var/lib/kubelet/pods\"' | wc -l` (should be 0). `kubectl delete --force` removes the object but leaves the mounts on the node; a reboot clears them."
+
+        # kubelet retries a failed teardown every ~2 minutes, so a real failure
+        # keeps the 10m increase above zero indefinitely; a reboot-time burst
+        # does not outlast the window.
+        - alert: KubeletVolumeTeardownFailing
+          expr: sum by (node) (increase(storage_operation_duration_seconds_count{job="kubelet", operation_name="volume_unmount", status!="success"}[10m])) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "kubelet on {{ $labels.node }} keeps failing to unmount pod volumes"
+            description: "Deleted pods on {{ $labels.node }} will stay Terminating. `talosctl -n <node> logs kubelet | grep 'TearDown failed'`; `device or resource busy` means the volume path is still a mount point (see terraform/docs/troubleshooting.md, \"Pods stuck Terminating\")."

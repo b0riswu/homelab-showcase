@@ -1,0 +1,45 @@
+# Upstream: kubernetes/argocd-apps/vault-warden.yaml
+# First service adopted into ArgoCD, chosen because it is the safest thing to get
+# wrong: image pinned by digest, and the only service whose restore drill had
+# passed at the time (2026-08-02).
+#
+# syncPolicy is deliberately absent — every sync is manual. Do not add
+# `automated` here until this has been through several real deploys without
+# surprises, and read the note on prune below before ever adding it.
+# Sanitized excerpt: repository URL is a placeholder.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: vault-warden
+  namespace: argocd
+spec:
+  project: default
+
+  source:
+    repoURL: git@github.com:example-org/homelab.git
+    targetRevision: main
+    # Everything Vaultwarden needs lives in tools/vaultwarden/: Deployment,
+    # Service and HTTPRoute, the Proxmox CSI data volume, the NFS backup volume
+    # and the backup CronJob. Until 2026-10-31 this read only
+    # tools/vault-warden.yaml (include filter), and the storage and backup files
+    # were applied by hand, outside ArgoCD's view.
+    #
+    # A directory of its own, not tools/ with an include list: a whole tools/
+    # source would tie Vaultwarden's sync status to every other manifest there,
+    # so a mistake in one could block a password-manager update.
+    path: kubernetes/tools/vaultwarden
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: tools
+
+  # No automated block on purpose:
+  #
+  #   selfHeal would revert any manual kubectl change, including an emergency
+  #   fix made during an incident.
+  #
+  #   prune deletes live resources absent from the manifest. The data volume is
+  #   a single-copy Proxmox CSI disk (Retain) and the old hostPath PV/PVC are
+  #   kept as a way back, so a mistaken prune is a restore event, not a resync.
+  #   It has a passing restore drill, which is the only reason prune is even
+  #   discussable here — the other services do not yet.
